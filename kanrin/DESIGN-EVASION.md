@@ -3,6 +3,9 @@
 > Companion to `ROADMAP.md`. This file owns the **evasion thesis**: why Kanrin
 > should be hard to block, and the concrete mechanisms that deliver it.
 > Priority and sequencing stay in `ROADMAP.md`. Task inventory stays in `TASKS*.md`.
+>
+> **Want the plain-language version first?** Read `EXPLAIN-SIMPLE.md` — the same
+> reasoning as a story, no jargon. `README.md` is the documentation map.
 
 ---
 
@@ -192,54 +195,18 @@ This is the difference between a tool that decays and a tool that adapts.
 
 ## 3. Phase 17 — Tasks
 
-New task IDs. These do not exist in `TASKS.md`, `TASKS-2.md` or `TASKS-3.md`.
+**The Phase 17 task checklist lives in `TASKS-4.md`** (groups 17.1 through 17.5).
+It is not restated here. This document owns only the reasoning above; the task
+inventory has a single home.
 
-### 17.1 — Single-Stack Invariance
+Summary of the five groups, each expanded in `TASKS-4.md`:
 
-- [ ] **17.1.1** Audit every branch where authenticated and unauthenticated
-      connections diverge; document each divergence
-- [ ] **17.1.2** Unify TLS termination so one implementation handles both
-- [ ] **17.1.3** Serve real content from the same process and code path
-- [ ] **17.1.4** Normalize response timing so auth outcome is not observable
-- [ ] **17.1.5** Port the published replay-behavior detector into the testbed
-- [ ] **17.1.6** Test: non-advancing-record tolerance identical in both branches
-- [ ] **17.1.7** Test: handshake replay produces identical observable behavior
-- [ ] **17.1.8** Test: error responses byte-identical to the genuine site
-
-### 17.2 — Carrier Occupancy
-
-- [ ] **17.2.1** Define the `Carrier` trait: byte envelope, shape, plausible duration
-- [ ] **17.2.2** Implement `WebBrowsing`, `VideoStreaming`, `FileSync`, `VideoCall`
-- [ ] **17.2.3** Implement carrier selection from workload class and posture
-- [ ] **17.2.4** Implement genuine cover fetch during connection establishment
-- [ ] **17.2.5** Implement volume accounting so tunnel bytes stay inside the envelope
-- [ ] **17.2.6** Implement graceful degradation when the tunnel exceeds the envelope
-- [ ] **17.2.7** Test: flow-level statistics match the claimed carrier class
-
-### 17.3 — Live-Corpus Shaping
-
-- [ ] **17.3.1** Implement passive reference collection from existing user traffic
-- [ ] **17.3.2** Implement packet-length distribution matching
-- [ ] **17.3.3** Implement inter-arrival-time distribution matching (**T6**)
-- [ ] **17.3.4** Implement first-N-seconds fidelity as a hard constraint (**T7**)
-- [ ] **17.3.5** Implement corpus aging and refresh
-- [ ] **17.3.6** Test: KL divergence against the reference stays under threshold
-
-### 17.4 — Constraint Distribution
-
-- [ ] **17.4.1** Define the constraint schema `(function, value, comparison, targets)`
-- [ ] **17.4.2** Implement the constraint evaluator in the shaping pipeline
-- [ ] **17.4.3** Implement Ed25519-signed constraint-set distribution via Admiral
-- [ ] **17.4.4** Implement client-side hot reload without reconnect
-- [ ] **17.4.5** Implement automatic fallback to an alternate set when blocked
-- [ ] **17.4.6** Test: a pushed constraint set changes observable output
-
-### 17.5 — Front Door Hardening
-
-- [ ] **17.5.1** Implement SPA-style authenticated admission for non-443 transports
-- [ ] **17.5.2** Ensure 443 always behaves as a normal web server (never silent)
-- [ ] **17.5.3** Implement per-source-IP probe-response consistency caching
-- [ ] **17.5.4** Test: active prober cannot distinguish us from the genuine origin
+- **17.1 Single-Stack Invariance** — one TLS implementation, one code path for
+  every client; the mechanism behind §2 Round 4.1.
+- **17.2 Volume-Plausible Carriers** — §2 Round 4.2.
+- **17.3 Live-Corpus Shaping** — §2 Round 4.3, answering T6 and T7.
+- **17.4 Constraint Distribution** — §2 Round 4.4, answering T2.
+- **17.5 Front Door Consistency** — the SPA + always-normal-443 pair.
 
 ---
 

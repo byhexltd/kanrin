@@ -2,13 +2,18 @@
 
 > **This file is the single source of truth for _what to build next and why_.**
 >
-> It does **not** restate tasks. `TASKS.md`, `TASKS-2.md`, `TASKS-3.md` own the
-> task inventory (~469 items). This file owns **priority, rationale, and the
-> capabilities that were missing from those files entirely** (Phase 16).
+> It does **not** restate tasks. `TASKS.md`, `TASKS-2.md`, `TASKS-3.md`,
+> `TASKS-4.md` own the task inventory. This file owns **priority, rationale, and
+> the reasoning** behind Phase 16.
 >
-> `DESIGN-EVASION.md` owns the **evasion thesis and Phase 17** — threat
-> intelligence, why each incumbent protocol was broken, and the mechanisms that
-> answer it. Read it before touching masquerade, stealth or posture work.
+> `DESIGN-EVASION.md` owns the **design thesis and Phase 17 reasoning** — threat
+> model, prior-art analysis, and mechanism design. Read it before touching
+> masquerade, stealth or posture work.
+>
+> **Task checklists for Phase 16 and 17 live only in `TASKS-4.md`.**
+>
+> New to the project? `README.md` is the documentation map and `EXPLAIN-SIMPLE.md`
+> is the plain-language design story.
 >
 > When priority changes, edit this file. When a task is added, edit `TASKS*.md`.
 
@@ -82,65 +87,34 @@ These capabilities are the core of the North Star and **do not appear anywhere
 in `TASKS.md`, `TASKS-2.md`, or `TASKS-3.md`.** Existing tasks 1.4.4, 1.4.5 and
 7.3.4, 7.3.5 gesture at migration but assume a reconnect, which breaks **I1**.
 
+> **Task checklists are in `TASKS-4.md`.** This section is the reasoning only.
+
 ### 16.1 — Session Continuity Layer
 
 A reliable, ordered, transport-agnostic pipe that outlives any individual
-connection. This is the foundation everything else in Phase 16 stands on.
-
-- [ ] **16.1.1** Add monotonic sequence number to every data chunk, scoped to the
-      session and independent of transport
-- [ ] **16.1.2** Implement send buffer retaining unacknowledged chunks
-- [ ] **16.1.3** Implement cumulative + selective acknowledgement chunk type
-- [ ] **16.1.4** Implement receive-side reorder buffer and duplicate suppression
-- [ ] **16.1.5** Implement replay of unacknowledged chunks onto a new transport
-- [ ] **16.1.6** Implement resumption handshake: prove session ownership without
-      a full key exchange, and report the last contiguous sequence received
-- [ ] **16.1.7** Bound the send buffer and apply back-pressure to the TUN reader
-- [ ] **16.1.8** Tests: kill the transport mid-transfer, verify byte stream is
-      intact and no inner TCP connection resets
-- [ ] **16.1.9** Tests: buffer bound is respected under a stalled transport
+connection. This is the foundation everything else in Phase 16 stands on: a
+transport can be dropped and its unacknowledged data replayed onto a new one
+without the application on top ever seeing a reset (**I1**).
 
 ### 16.2 — Hot Standby & Seamless Switch
 
-- [ ] **16.2.1** Keep the next-best transport fully handshaked and idle
-- [ ] **16.2.2** Implement switch as an atomic swap of the active transport
-      handle, followed by 16.1.5 replay
-- [ ] **16.2.3** Implement liveness detection fast enough to switch before the
-      inner TCP stack notices (target: detect under 1s, switch under 200ms)
-- [ ] **16.2.4** Implement make-before-break ordering: never tear down the old
-      transport until the new one has carried an acknowledged chunk
-- [ ] **16.2.5** Implement switch cooldown and flap damping
-- [ ] **16.2.6** Emit a user-facing event describing the switch, never an error
-- [ ] **16.2.7** Tests: transport blocked mid-download, download completes
-- [ ] **16.2.8** Tests: repeated forced switches do not corrupt the stream
+Keep the next-best transport handshaked and idle, and switch by atomic handle
+swap with make-before-break ordering: never tear down the old path until the new
+one has carried an acknowledged chunk. Target: detect under 1s, switch under
+200ms — faster than the inner TCP stack notices.
 
 ### 16.3 — Multipath
 
-Beyond anything Hysteria2 or VLESS offer today.
-
-- [ ] **16.3.1** Allow two or more healthy transports to be active at once
-- [ ] **16.3.2** Implement scheduler striping chunks across paths by measured
-      capacity
-- [ ] **16.3.3** Implement hedging: duplicate latency-critical chunks on a second
-      path, deduplicated by 16.1.4
-- [ ] **16.3.4** Implement per-path health accounting feeding the scoreboard
-- [ ] **16.3.5** Tests: one path dies under load, throughput dips but no stall
+Two or more healthy transports active at once — striping by capacity, hedging
+latency-critical chunks — deduplicated by the 16.1 reorder buffer. Beyond
+anything Hysteria2 or VLESS offer today.
 
 ### 16.4 — Adaptive Posture
 
 The mechanism that satisfies North Star #2: pay for stealth only when needed.
-
-- [ ] **16.4.1** Define postures: `Performance`, `Balanced`, `Evasion`
-- [ ] **16.4.2** `Performance` — minimal padding, no cover traffic, largest
-      window, lowest latency. Used when detection reports a clean network
-- [ ] **16.4.3** `Evasion` — full stealth pipeline: rhythm shaping, padding,
-      fragmentation, cover traffic
-- [ ] **16.4.4** Implement promotion and demotion driven by detector, prober and
-      scoreboard, with hysteresis to prevent oscillation
-- [ ] **16.4.5** Implement immediate demotion to `Evasion` on probe-like events
-      (repeated handshake failures, RST patterns, sudden path loss)
-- [ ] **16.4.6** Surface current posture in status output
-- [ ] **16.4.7** Tests: posture escalates under simulated DPI, relaxes when clean
+`Performance` when detection reports a clean network; `Evasion` (full shaping
+pipeline) under pressure; promotion/demotion with hysteresis to prevent
+oscillation.
 
 ---
 
