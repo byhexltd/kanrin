@@ -1,0 +1,35 @@
+[package]
+name = "kanrin-transport"
+version.workspace = true
+edition.workspace = true
+description = "Kanrin transport layer — trait definitions and P1-P6 implementations"
+
+[features]
+default = ["quic", "tls-tcp", "websocket"]
+quic = ["quinn"]
+tls-tcp = ["tokio-rustls"]
+websocket = ["tokio-tungstenite"]
+http2 = ["hyper", "hyper-util"]
+full = ["quic", "tls-tcp", "websocket", "http2"]
+
+[dependencies]
+kanrin-protocol = { path = "../kanrin-protocol" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+rand = { workspace = true }
+futures = { workspace = true }
+
+# TLS roots and socket utils
+webpki-roots = "0.26"
+socket2 = { version = "0.5", features = ["all"] }
+
+# Optional transports
+quinn = { workspace = true, optional = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true, optional = true }
+tokio-tungstenite = { workspace = true, optional = true }
+hyper = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }

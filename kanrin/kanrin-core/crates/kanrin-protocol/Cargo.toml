@@ -1,0 +1,21 @@
+[package]
+name = "kanrin-protocol"
+version.workspace = true
+edition.workspace = true
+description = "Kanrin wire protocol, cryptography, handshake, and session management"
+
+[dependencies]
+chacha20poly1305 = { workspace = true }
+x25519-dalek = { workspace = true }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+zeroize = { workspace = true }
+subtle = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

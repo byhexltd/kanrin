@@ -1,0 +1,14 @@
+[package]
+name = "kanrin-stealth"
+version.workspace = true
+edition.workspace = true
+description = "Kanrin stealth engine — traffic shaping, fingerprint, fragmentation"
+
+[dependencies]
+kanrin-protocol = { path = "../kanrin-protocol" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+rand = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }

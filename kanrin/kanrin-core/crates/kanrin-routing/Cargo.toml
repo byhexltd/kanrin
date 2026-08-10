@@ -1,0 +1,15 @@
+[package]
+name = "kanrin-routing"
+version.workspace = true
+edition.workspace = true
+description = "Kanrin routing engine — rules, GeoIP, Iran preset, per-app routing"
+
+[dependencies]
+kanrin-protocol = { path = "../kanrin-protocol" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+lru = { workspace = true }
+dashmap = { workspace = true }

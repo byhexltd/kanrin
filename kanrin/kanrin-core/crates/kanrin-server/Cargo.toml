@@ -1,0 +1,28 @@
+[package]
+name = "kanrin-server"
+version.workspace = true
+edition.workspace = true
+description = "Kanrin VPN server — Harbor exit node"
+
+[[bin]]
+name = "kanrin-server"
+path = "src/main.rs"
+
+[dependencies]
+kanrin-protocol = { path = "../kanrin-protocol" }
+kanrin-tun = { path = "../kanrin-tun" }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = "2"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+clap = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+bytes = { workspace = true }
+rcgen = { workspace = true }

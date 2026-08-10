@@ -1,0 +1,19 @@
+[package]
+name = "kanrin-cli"
+version.workspace = true
+edition.workspace = true
+description = "Kanrin CLI client — connect, disconnect, status, test"
+
+[[bin]]
+name = "kanrin"
+path = "src/main.rs"
+
+[dependencies]
+kanrin-client = { path = "../kanrin-client" }
+kanrin-engine = { path = "../kanrin-engine" }
+tokio = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+serde_yaml = { workspace = true }

@@ -1,0 +1,72 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/kanrin-protocol",
+    "crates/kanrin-transport",
+    "crates/kanrin-stealth",
+    "crates/kanrin-routing",
+    "crates/kanrin-tun",
+    "crates/kanrin-engine",
+    "crates/kanrin-plugin",
+    "crates/kanrin-client",
+    "crates/kanrin-cli",
+    "crates/kanrin-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Kanrin Team"]
+rust-version = "1.75"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# Crypto
+chacha20poly1305 = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+hkdf = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+zeroize = { version = "1", features = ["derive"] }
+subtle = "2"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+bytes = "1"
+
+# Networking
+quinn = "0.11"
+rustls = { version = "0.23", features = ["ring"] }
+tokio-rustls = "0.26"
+tokio-tungstenite = "0.24"
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+trust-dns-client = "0.23"
+
+# TUN
+wintun = "0.5"
+
+# WASM Plugin
+wasmtime = "25"
+
+# Logging & Errors
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+thiserror = "2"
+anyhow = "1"
+
+# Utils
+lru = "0.12"
+dashmap = "6"
+parking_lot = "0.12"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+rcgen = "0.13"

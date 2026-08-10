@@ -1,0 +1,27 @@
+# --- Third-party reference projects: never push these ---
+/hysteria-master/
+/sing-box-testing/
+
+# --- Rust build artifacts (the bulk of the file count) ---
+target/
+**/target/
+*.rs.bk
+Cargo.lock.bak
+
+# --- Secrets & runtime config: MUST NOT be public ---
+kanrin.yml
+**/kanrin.yml
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+server.yml
+**/server.yml
+
+# --- Editor / OS noise ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

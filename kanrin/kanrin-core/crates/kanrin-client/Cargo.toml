@@ -1,0 +1,30 @@
+[package]
+name = "kanrin-client"
+version.workspace = true
+edition.workspace = true
+description = "Kanrin client library — public API, pipeline orchestrator, FFI"
+
+[dependencies]
+kanrin-protocol = { path = "../kanrin-protocol" }
+kanrin-transport = { path = "../kanrin-transport" }
+kanrin-stealth = { path = "../kanrin-stealth" }
+kanrin-routing = { path = "../kanrin-routing" }
+kanrin-tun = { path = "../kanrin-tun" }
+kanrin-engine = { path = "../kanrin-engine" }
+kanrin-plugin = { path = "../kanrin-plugin" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+parking_lot = { workspace = true }
+once_cell = "1"
+rustls = { workspace = true }
+
+[lib]
+crate-type = ["lib", "cdylib", "staticlib"]

@@ -1,0 +1,26 @@
+[package]
+name = "kanrin-tun"
+version.workspace = true
+edition.workspace = true
+description = "Kanrin TUN interface, packet parsing, NAT table, DNS interception, kill switch"
+
+[dependencies]
+kanrin-protocol = { path = "../kanrin-protocol" }
+kanrin-routing = { path = "../kanrin-routing" }
+tokio = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+lru = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+wintun = { workspace = true }
+windows-sys = { version = "0.59", features = ["Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_NetworkManagement_Ndis", "Win32_Security", "Win32_System_IO"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"

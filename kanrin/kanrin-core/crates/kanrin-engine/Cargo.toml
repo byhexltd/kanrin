@@ -1,0 +1,18 @@
+[package]
+name = "kanrin-engine"
+version.workspace = true
+edition.workspace = true
+description = "Kanrin self-healing engine — prober, scoreboard, switcher, bootstrap, network detection"
+
+[dependencies]
+kanrin-protocol = { path = "../kanrin-protocol" }
+kanrin-transport = { path = "../kanrin-transport" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+rand = { workspace = true }
+chrono = { workspace = true }
