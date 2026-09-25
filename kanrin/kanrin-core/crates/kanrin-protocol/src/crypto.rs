@@ -4,7 +4,7 @@ use chacha20poly1305::{
 };
 use hkdf::Hkdf;
 use sha2::Sha256;
-use x25519_dalek::{EphemeralSecret, PublicKey, SharedSecret};
+use x25519_dalek::{EphemeralSecret, PublicKey};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::error::ProtocolError;
@@ -62,6 +62,23 @@ impl NonceCounter {
     }
 }
 
+/// Derive a 96-bit AEAD nonce deterministically from a chunk's sequence number.
+///
+/// The nonce is `[0u8; 4] || seq.to_be_bytes()`. Because each direction encrypts
+/// under a distinct key (`client_write_key` vs `server_write_key`) and the
+/// sequence is strictly increasing and unique per direction, no `(key, nonce)`
+/// pair is ever reused.
+///
+/// Carrying the sequence on the wire and deriving the nonce from it — rather
+/// than from a positional counter that assumes in-order, gap-free delivery —
+/// is what lets the receiver decrypt chunks that arrive reordered, replayed onto
+/// a new transport, or striped across multiple paths.
+pub fn nonce_from_sequence(seq: u64) -> [u8; NONCE_SIZE] {
+    let mut nonce = [0u8; NONCE_SIZE];
+    nonce[NONCE_SIZE - 8..].copy_from_slice(&seq.to_be_bytes());
+    nonce
+}
+
 /// Derive session keys from a shared secret using HKDF-SHA256.
 pub fn derive_session_keys(
     shared_secret: &[u8; 32],
@@ -82,6 +99,45 @@ pub fn derive_session_keys(
         client_write_key: client_key,
         server_write_key: server_key,
     })
+}
+
+/// Derive the key used to prove session ownership when resuming on a new
+/// transport (16.1.6).
+///
+/// Deliberately a *separate* key rather than one of the AEAD write keys: the
+/// resumption proof is computed over attacker-visible material, so reusing an
+/// encryption key for it would mix two primitives under one key. The distinct
+/// HKDF `info` string keeps the domains apart.
+///
+/// Both write keys feed the input, so the value is identical on client and
+/// server and cannot be derived by anyone who did not complete the handshake.
+pub fn derive_resumption_key(keys: &SessionKeys) -> Result<[u8; KEY_SIZE], ProtocolError> {
+    let mut ikm = [0u8; KEY_SIZE * 2];
+    ikm[..KEY_SIZE].copy_from_slice(&keys.client_write_key);
+    ikm[KEY_SIZE..].copy_from_slice(&keys.server_write_key);
+
+    let hk = Hkdf::<Sha256>::new(None, &ikm);
+    let mut key = [0u8; KEY_SIZE];
+    hk.expand(b"kanrin-resumption", &mut key)
+        .map_err(|e| ProtocolError::Crypto(format!("HKDF expand failed: {}", e)))?;
+
+    ikm.zeroize();
+    Ok(key)
+}
+
+/// HMAC-SHA256 over the concatenated `parts`.
+///
+/// Callers must keep the transcript unambiguous — every field fed in is
+/// fixed-width, so plain concatenation cannot be re-split into a different
+/// message.
+pub fn mac_sha256(key: &[u8; KEY_SIZE], parts: &[&[u8]]) -> [u8; 32] {
+    use hmac::{Hmac, Mac};
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key)
+        .expect("HMAC accepts keys of any length");
+    for part in parts {
+        mac.update(part);
+    }
+    mac.finalize().into_bytes().into()
 }
 
 /// Encrypt plaintext with ChaCha20-Poly1305.

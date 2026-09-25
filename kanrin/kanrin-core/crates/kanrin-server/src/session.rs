@@ -1,18 +1,47 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tokio_rustls::server::TlsStream;
 
+use kanrin_protocol::continuity::{Received, Replay};
 use kanrin_protocol::handshake::{
     AuthStatus, ClientFinished, ClientHello, ServerFinished, ServerHandshake,
 };
-use kanrin_protocol::session::{Session, SessionId};
-use kanrin_protocol::wire::{Chunk, ChunkType};
+use kanrin_protocol::resume::{ResumeRequest, ResumeResponse, ResumeStatus};
+use kanrin_protocol::session::SessionId;
+use kanrin_protocol::wire::{Chunk, ChunkHeader, ChunkType, ControlMessage, HEADER_SIZE};
 
 use crate::config::ServerConfig;
 use crate::forwarder::PacketForwarder;
+use crate::registry::{SessionEntry, SessionRegistry};
+
+/// Acknowledge after this many data chunks. The client cannot release its send
+/// buffer until it hears from us, so acking too rarely would throttle it; acking
+/// every chunk would roughly double the frame count for no benefit.
+const ACK_EVERY_N_CHUNKS: usize = 32;
+
+/// Also acknowledge if this long has passed, so a slow flow does not sit below
+/// the chunk threshold indefinitely.
+///
+/// Checked when a chunk arrives rather than on a timer: the read loop uses
+/// `read_exact`, which is not cancel-safe, so racing it against an interval in
+/// a `select!` would abandon partially-read frames.
+const ACK_MAX_DELAY: Duration = Duration::from_millis(200);
+
+/// What became of the tunnel address the acceptor reserved for a connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionOutcome {
+    /// A new session took the address; it stays owned by the registry entry
+    /// and is reclaimed only when that entry expires.
+    AddressTaken,
+    /// The connection attached to an existing session, so the reserved
+    /// address was never used and goes straight back to the pool.
+    AddressUnused,
+}
 
 /// Manages a single client connection from TLS accept to data forwarding.
 pub struct ClientSession {
@@ -96,8 +125,111 @@ impl ClientSession {
         }
     }
 
-    /// Run the full client lifecycle: handshake -> auth -> data forwarding.
-    pub async fn run(mut self, forwarder: Arc<PacketForwarder>) -> anyhow::Result<()> {
+    /// Serve one connection.
+    ///
+    /// The first chunk decides which of two things this is. Its type is
+    /// readable from the plaintext header, so the choice needs no key and no
+    /// guessing between a `ClientHello` and a `ResumeRequest`:
+    ///
+    /// - `Handshake` — a new client. Full key exchange, new tunnel address,
+    ///   new registry entry.
+    /// - `Resume` — a transport switch. The client proves it owns a live
+    ///   session and reattaches to it, keeping its address, sequence counters
+    ///   and both continuity buffers.
+    pub async fn run(
+        mut self,
+        forwarder: Arc<PacketForwarder>,
+        registry: Arc<SessionRegistry>,
+    ) -> anyhow::Result<ConnectionOutcome> {
+        let first = self.recv_frame().await?;
+        if first.len() < HEADER_SIZE {
+            anyhow::bail!("first frame is shorter than a chunk header");
+        }
+        let header = ChunkHeader::decode(&mut &first[..HEADER_SIZE])?;
+
+        match header.chunk_type {
+            ChunkType::Resume => {
+                let entry = self.accept_resume(&first, &registry).await?;
+                let peer_addr = self.peer_addr;
+                Self::serve(self.stream, peer_addr, entry, forwarder).await;
+                Ok(ConnectionOutcome::AddressUnused)
+            }
+            ChunkType::Handshake => {
+                let entry = self.accept_new(first, &forwarder, &registry).await?;
+                let Some(entry) = entry else {
+                    // Authentication failed; the client was already told.
+                    return Ok(ConnectionOutcome::AddressUnused);
+                };
+                let peer_addr = self.peer_addr;
+                Self::serve(self.stream, peer_addr, entry, forwarder).await;
+                Ok(ConnectionOutcome::AddressTaken)
+            }
+            other => anyhow::bail!("unexpected first chunk type: {:?}", other),
+        }
+    }
+
+    /// Attach to an existing session (16.2.1/16.2.2).
+    ///
+    /// A request naming an unknown session, or carrying a proof that does not
+    /// verify, simply drops the connection. Answering would turn the server
+    /// into an oracle for which session ids are live; staying silent makes a
+    /// failed resume indistinguishable from any other dead connection, and the
+    /// client falls back to a full handshake anyway.
+    async fn accept_resume(
+        &mut self,
+        first: &[u8],
+        registry: &SessionRegistry,
+    ) -> anyhow::Result<Arc<SessionEntry>> {
+        let chunk = Chunk::decode_encrypted(first, &[0u8; 32], &[0u8; 12])
+            .map_err(|e| anyhow::anyhow!("decode resume chunk: {}", e))?;
+        let request = ResumeRequest::decode(&chunk.payload)
+            .map_err(|e| anyhow::anyhow!("parse resume request: {}", e))?;
+
+        let entry = registry
+            .get(&request.session_id)
+            .ok_or_else(|| anyhow::anyhow!("resume names an unknown session"))?;
+
+        let status = request
+            .verify(&entry.keys)
+            .map_err(|e| anyhow::anyhow!("verify resume: {}", e))?;
+        if status != ResumeStatus::Ok {
+            anyhow::bail!("resume rejected: {:?}", status);
+        }
+
+        // The client told us how far it got, so everything below that can be
+        // dropped and the rest replayed by `serve`.
+        let released = entry
+            .send_buffer
+            .lock()
+            .await
+            .apply_ack(request.next_expected, &[]);
+
+        // Our own position goes back, so the client can do the same.
+        let next_expected = entry.recv_buffer.lock().await.next_expected();
+        let response = ResumeResponse::new(ResumeStatus::Ok, next_expected, &request, &entry.keys)
+            .map_err(|e| anyhow::anyhow!("sign resume response: {}", e))?;
+        let encoded = Chunk::new_resume(response.encode())
+            .encode_encrypted(&[0u8; 32], &[0u8; 12])
+            .map_err(|e| anyhow::anyhow!("encode resume response: {}", e))?;
+        self.send_frame(&encoded).await?;
+
+        tracing::info!(
+            peer = %self.peer_addr,
+            tunnel_ip = %entry.assigned_ip,
+            released,
+            "session resumed on a new transport"
+        );
+
+        Ok(entry)
+    }
+
+    /// Full handshake for a client we have never seen.
+    async fn accept_new(
+        &mut self,
+        client_hello_data: Vec<u8>,
+        forwarder: &PacketForwarder,
+        registry: &SessionRegistry,
+    ) -> anyhow::Result<Option<Arc<SessionEntry>>> {
         tracing::info!(
             peer = %self.peer_addr,
             assigned_ip = %self.assigned_ip,
@@ -107,8 +239,6 @@ impl ClientSession {
         // === Step 1: Kanrin Handshake ===
         let mut server_hs = ServerHandshake::new();
 
-        // Receive ClientHello
-        let client_hello_data = self.recv_frame().await?;
         let temp_key = [0u8; 32];
         let temp_nonce = [0u8; 12];
         let client_hello_chunk = Chunk::decode_encrypted(&client_hello_data, &temp_key, &temp_nonce)
@@ -147,11 +277,19 @@ impl ClientSession {
             .verify_auth(&client_finished, &session_keys, &self.config.password)
             .map_err(|e| anyhow::anyhow!("verify auth: {}", e))?;
 
-        // Send ServerFinished
+        // Send ServerFinished.
+        //
+        // The token is `tunnel_ip(4) || session_id(16)`. The id has to reach
+        // the client here: it is the handle the client presents when resuming
+        // on a new transport, and there is no later opportunity to send it
+        // that a switch could rely on.
+        let session_id = SessionId::generate();
         let server_finished = ServerFinished {
             status: auth_status,
             session_token: if auth_status == AuthStatus::Ok {
-                Some(self.assigned_ip.octets().to_vec())
+                let mut token = self.assigned_ip.octets().to_vec();
+                token.extend_from_slice(session_id.as_bytes());
+                Some(token)
             } else {
                 None
             },
@@ -169,7 +307,7 @@ impl ClientSession {
                 status = ?auth_status,
                 "authentication failed"
             );
-            return Ok(());
+            return Ok(None);
         }
 
         tracing::info!(
@@ -178,34 +316,92 @@ impl ClientSession {
             "client authenticated — entering data mode"
         );
 
-        // === Step 3: Data forwarding ===
-        let peer_addr = self.peer_addr;
-        let assigned_ip = self.assigned_ip;
-
-        let session = Arc::new(tokio::sync::Mutex::new(Session::new(
-            SessionId::generate(),
-            session_keys,
-        )));
-
         // Subscribe to reply packets addressed to this client's tunnel IP.
-        let mut reply_rx = forwarder.register_client(assigned_ip);
+        let reply_rx = forwarder.register_client(self.assigned_ip);
 
+        Ok(Some(registry.insert(
+            session_id,
+            session_keys,
+            self.assigned_ip,
+            reply_rx,
+        )))
+    }
+
+    /// Carry data for as long as this connection lives.
+    ///
+    /// All mutable state belongs to `entry`, not to the connection, which is
+    /// what makes a switch invisible to the tunnelled traffic.
+    async fn serve(
+        stream: TlsStream<TcpStream>,
+        peer_addr: SocketAddr,
+        entry: Arc<SessionEntry>,
+        forwarder: Arc<PacketForwarder>,
+    ) {
         // `read_exact` is not cancel-safe, so the read and write directions run
         // independently instead of racing inside a single `select!`.
-        let (mut reader, mut writer) = tokio::io::split(self.stream);
+        let (mut reader, mut writer) = tokio::io::split(stream);
+
+        // Acknowledgements are produced by the reader loop but have to leave
+        // through the writer, which owns the write half. A channel keeps that
+        // ownership intact; `recv` on both queues is cancel-safe, so the writer
+        // can race them in a `select!`.
+        let (ack_tx, mut ack_rx) = mpsc::unbounded_channel::<ControlMessage>();
+
+        // 16.1.5 — anything the previous transport never got acknowledged for
+        // goes out first, ahead of new traffic, so the client's byte stream
+        // continues where it stopped. Empty for a fresh session.
+        {
+            let send_buffer = entry.send_buffer.lock().await;
+            let mut replay = Replay::new();
+            let mut replayed = 0usize;
+            while let Some((sequence, data)) = replay.next_chunk(&send_buffer) {
+                if write_frame(&mut writer, data).await.is_err() {
+                    break;
+                }
+                replay.confirm_sent(sequence);
+                replayed += 1;
+            }
+            if replayed > 0 {
+                tracing::info!(peer = %peer_addr, replayed, "replayed unacknowledged chunks");
+            }
+        }
 
         // Internet -> client
-        let writer_session = session.clone();
+        let writer_entry = entry.clone();
         let writer_task = tokio::spawn(async move {
-            while let Some(packet) = reply_rx.recv().await {
-                let chunk = Chunk::new_data(packet);
+            // Held for the lifetime of this connection. A later attachment
+            // aborts this task, which releases the queue to its successor.
+            let mut reply_rx = writer_entry.reply_rx.lock().await;
+
+            loop {
+                let chunk = tokio::select! {
+                    packet = reply_rx.recv() => match packet {
+                        Some(packet) => Chunk::new_data(packet),
+                        None => break,
+                    },
+                    ack = ack_rx.recv() => match ack {
+                        Some(ack) => Chunk::new_control(ack.encode()),
+                        None => break,
+                    },
+                };
+
+                let is_data = chunk.header.chunk_type == ChunkType::Data;
                 let encrypted = {
-                    let mut s = writer_session.lock().await;
-                    s.encrypt_outgoing(&chunk, false)
+                    let mut s = writer_entry.session.lock().await;
+                    let sequence = s.send_nonce_value();
+                    s.encrypt_outgoing(&chunk, false).map(|bytes| (sequence, bytes))
                 };
 
                 match encrypted {
-                    Ok(bytes) => {
+                    Ok((sequence, bytes)) => {
+                        // Only data is retained: a lost ack is superseded by
+                        // the next one, so replaying it would be pure cost.
+                        if is_data {
+                            let mut send_buffer = writer_entry.send_buffer.lock().await;
+                            if let Err(e) = send_buffer.push(sequence, bytes.clone()) {
+                                tracing::warn!(error = %e, "server send buffer full");
+                            }
+                        }
                         if write_frame(&mut writer, &bytes).await.is_err() {
                             break;
                         }
@@ -218,7 +414,20 @@ impl ClientSession {
             }
         });
 
-        // Client -> internet
+        // Evict whatever connection held this session before us. Doing it here
+        // rather than at attach time means the replay above has already been
+        // written, so the client never sees a gap between the two transports.
+        entry.attach(vec![writer_task.abort_handle()]);
+
+        // Client -> internet.
+        //
+        // Chunks go through the continuity layer rather than straight to the
+        // forwarder: it restores the original order if a transport switch
+        // delivered them out of order, and silently drops the duplicates that
+        // a replay (16.1.5) is expected to produce.
+        let mut unacked_chunks = 0usize;
+        let mut last_ack = Instant::now();
+
         loop {
             let data = match read_frame(&mut reader).await {
                 Ok(d) => d,
@@ -227,9 +436,10 @@ impl ClientSession {
                     break;
                 }
             };
+            entry.touch();
 
             let chunk = {
-                let mut s = session.lock().await;
+                let mut s = entry.session.lock().await;
                 s.decrypt_incoming(&data, false)
             };
 
@@ -243,27 +453,70 @@ impl ClientSession {
 
             match chunk.header.chunk_type {
                 ChunkType::Data => {
-                    forwarder.send_to_internet(&chunk.payload).await;
+                    let sequence = chunk.header.sequence;
+                    let ready = {
+                        let mut recv_buffer = entry.recv_buffer.lock().await;
+                        match recv_buffer.accept(sequence, chunk.payload) {
+                            Ok(Received::Duplicate) => continue,
+                            Ok(_) => recv_buffer.drain_ready(),
+                            Err(e) => {
+                                // The peer is running far ahead of a gap it
+                                // never filled. Dropping the chunk keeps memory
+                                // bounded; it stays unacknowledged, so it will
+                                // be replayed.
+                                tracing::warn!(peer = %peer_addr, error = %e, "receive buffer full");
+                                continue;
+                            }
+                        }
+                    };
+                    for packet in ready {
+                        forwarder.send_to_internet(&packet).await;
+                    }
+
+                    unacked_chunks += 1;
+                    if unacked_chunks >= ACK_EVERY_N_CHUNKS || last_ack.elapsed() >= ACK_MAX_DELAY {
+                        unacked_chunks = 0;
+                        last_ack = Instant::now();
+                        let ack = entry.recv_buffer.lock().await.build_ack();
+                        if ack_tx.send(ack).is_err() {
+                            break;
+                        }
+                    }
                 }
-                ChunkType::Control => {
-                    tracing::debug!("received control chunk");
-                }
+                ChunkType::Control => match ControlMessage::decode(&chunk.payload) {
+                    // The client's ack is what releases our retained chunks.
+                    Ok(ControlMessage::Ack { next_expected, ranges }) => {
+                        entry.send_buffer.lock().await.apply_ack(next_expected, &ranges);
+                    }
+                    // The client's liveness probe (16.2.3). Answering is what
+                    // distinguishes a quiet link from a blocked one, so it
+                    // must never be dropped on the floor.
+                    Ok(ControlMessage::Ping { timestamp }) => {
+                        if ack_tx.send(ControlMessage::Pong { timestamp }).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(other) => tracing::debug!(?other, "control message"),
+                    Err(e) => tracing::warn!(error = %e, "bad control message"),
+                },
                 _ => {}
             }
         }
 
-        forwarder.unregister_client(assigned_ip);
+        // The session deliberately outlives the connection: the client may be
+        // switching transports and about to reattach. Its address is released
+        // only when the registry reaps the entry.
         writer_task.abort();
+        entry.touch();
 
-        let s = session.lock().await;
+        let s = entry.session.lock().await;
         tracing::info!(
             peer = %peer_addr,
+            session = ?entry.id,
             bytes_rx = s.bytes_received,
             bytes_tx = s.bytes_sent,
-            "client session ended"
+            "connection ended"
         );
-
-        Ok(())
     }
 
     /// Read a length-prefixed frame from the TLS stream.

@@ -1,6 +1,9 @@
 pub mod config;
 pub mod pipeline;
 pub mod events;
+pub mod switch;
+pub mod multipath;
+pub mod posture;
 pub mod ffi;
 
 use std::sync::Arc;
@@ -41,6 +44,12 @@ pub struct ConnectionStats {
     pub current_endpoint: String,
     pub latency_ms: u32,
     pub transport_switches: u32,
+    /// Current adaptive posture (16.4.6), e.g. `"balanced"`.
+    ///
+    /// Surfaced because the user otherwise has no way to tell a slow network
+    /// from the client deliberately trading throughput for evasion — and that
+    /// distinction changes what they should do about it.
+    pub posture: String,
 }
 
 impl KanrinClient {

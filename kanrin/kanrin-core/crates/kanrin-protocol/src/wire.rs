@@ -6,8 +6,14 @@ use crate::error::ProtocolError;
 /// Current protocol version
 pub const PROTOCOL_VERSION: u8 = 1;
 
-/// Minimum chunk header size (version + type + payload_len + padding_len = 5 bytes)
-pub const HEADER_SIZE: usize = 5;
+/// Chunk header size on the wire:
+/// version(1) + type(1) + sequence(8) + payload_len(2) + padding_len(1) = 13 bytes.
+///
+/// The sequence is carried explicitly so the receiver can derive the decryption
+/// nonce from it (see `crypto::nonce_from_sequence`) regardless of the order in
+/// which chunks arrive. It is authenticated as AAD, so it cannot be forged or
+/// altered without failing decryption.
+pub const HEADER_SIZE: usize = 13;
 
 /// Maximum payload size per chunk (64 KB)
 pub const MAX_PAYLOAD_SIZE: usize = 65535;
@@ -23,6 +29,13 @@ pub enum ChunkType {
     Data = 0x02,
     Control = 0x03,
     Padding = 0x04,
+    /// Carries the resumption handshake of 16.1.6.
+    ///
+    /// A distinct type rather than a discriminator inside the payload: it lets
+    /// the server tell "attach to an existing session" from "start a new one"
+    /// by reading the chunk header alone, with no ambiguity between a
+    /// `ClientHello` and a `ResumeRequest` whose leading bytes are random.
+    Resume = 0x05,
 }
 
 impl ChunkType {
@@ -32,6 +45,7 @@ impl ChunkType {
             0x02 => Ok(Self::Data),
             0x03 => Ok(Self::Control),
             0x04 => Ok(Self::Padding),
+            0x05 => Ok(Self::Resume),
             _ => Err(ProtocolError::InvalidChunk(format!(
                 "unknown chunk type: 0x{:02x}",
                 b
@@ -45,6 +59,9 @@ impl ChunkType {
 pub struct ChunkHeader {
     pub version: u8,
     pub chunk_type: ChunkType,
+    /// Monotonic, per-direction sequence number. Scopes the chunk to the session
+    /// independently of transport, and seeds the AEAD nonce.
+    pub sequence: u64,
     pub payload_length: u16,
     pub padding_length: u8,
 }
@@ -53,6 +70,7 @@ impl ChunkHeader {
     pub fn encode(&self, buf: &mut BytesMut) {
         buf.put_u8(self.version);
         buf.put_u8(self.chunk_type as u8);
+        buf.put_u64(self.sequence);
         buf.put_u16(self.payload_length);
         buf.put_u8(self.padding_length);
     }
@@ -71,14 +89,18 @@ impl ChunkHeader {
         }
 
         let chunk_type = ChunkType::from_byte(buf[1])?;
-        let payload_length = u16::from_be_bytes([buf[2], buf[3]]);
-        let padding_length = buf[4];
+        let sequence = u64::from_be_bytes([
+            buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9],
+        ]);
+        let payload_length = u16::from_be_bytes([buf[10], buf[11]]);
+        let padding_length = buf[12];
 
         buf.advance(HEADER_SIZE);
 
         Ok(Self {
             version,
             chunk_type,
+            sequence,
             payload_length,
             padding_length,
         })
@@ -105,6 +127,7 @@ impl Chunk {
             header: ChunkHeader {
                 version: PROTOCOL_VERSION,
                 chunk_type: ChunkType::Data,
+                sequence: 0,
                 payload_length: payload.len() as u16,
                 padding_length: padding_len,
             },
@@ -118,6 +141,22 @@ impl Chunk {
             header: ChunkHeader {
                 version: PROTOCOL_VERSION,
                 chunk_type: ChunkType::Handshake,
+                sequence: 0,
+                payload_length: payload.len() as u16,
+                padding_length: 0,
+            },
+            payload,
+        }
+    }
+
+    /// Create a resumption chunk (no padding — like the handshake, it is sent
+    /// before any session sequence exists).
+    pub fn new_resume(payload: Vec<u8>) -> Self {
+        Self {
+            header: ChunkHeader {
+                version: PROTOCOL_VERSION,
+                chunk_type: ChunkType::Resume,
+                sequence: 0,
                 payload_length: payload.len() as u16,
                 padding_length: 0,
             },
@@ -131,6 +170,7 @@ impl Chunk {
             header: ChunkHeader {
                 version: PROTOCOL_VERSION,
                 chunk_type: ChunkType::Control,
+                sequence: 0,
                 payload_length: payload.len() as u16,
                 padding_length: (rand::random::<u8>() % 32) as u8,
             },
@@ -144,6 +184,7 @@ impl Chunk {
             header: ChunkHeader {
                 version: PROTOCOL_VERSION,
                 chunk_type: ChunkType::Padding,
+                sequence: 0,
                 payload_length: 0,
                 padding_length: size,
             },
@@ -152,7 +193,12 @@ impl Chunk {
     }
 
     /// Encode chunk into bytes, encrypting payload with given key/nonce.
-    /// Format: [header(5)] [encrypted(payload + padding)](variable) [tag(16)]
+    /// Format: [header(13)] [encrypted(payload + padding)](variable) [tag(16)]
+    ///
+    /// This is the low-level primitive with an explicit nonce, used by the
+    /// handshake (which has no session sequence yet). Data-plane traffic goes
+    /// through `encode_sequenced` / `decode_sequenced`, which derive the nonce
+    /// from the carried sequence.
     pub fn encode_encrypted(
         &self,
         key: &[u8; 32],
@@ -215,10 +261,67 @@ impl Chunk {
         Ok(Self { header, payload })
     }
 
+    /// Encode a data-plane chunk under the given sequence number, deriving the
+    /// AEAD nonce from that sequence. The sequence is written into the header
+    /// (overriding whatever `self.header.sequence` held) and authenticated as
+    /// AAD, so it is bound cryptographically to the ciphertext.
+    ///
+    /// This is the encode path for all post-handshake traffic. The carried
+    /// sequence is what allows the peer to decrypt out of order, after a
+    /// transport switch, or across multiple paths.
+    pub fn encode_sequenced(
+        &self,
+        key: &[u8; 32],
+        sequence: u64,
+    ) -> Result<Vec<u8>, ProtocolError> {
+        let mut header = self.header.clone();
+        header.sequence = sequence;
+        let chunk = Chunk {
+            header,
+            payload: self.payload.clone(),
+        };
+        let nonce = crypto::nonce_from_sequence(sequence);
+        chunk.encode_encrypted(key, &nonce)
+    }
+
+    /// Decode a data-plane chunk, deriving the AEAD nonce from the sequence
+    /// carried in the (authenticated) header. Because the nonce comes from the
+    /// wire and not from a positional counter, chunks may be decoded in any
+    /// order without desynchronising.
+    pub fn decode_sequenced(data: &[u8], key: &[u8; 32]) -> Result<Self, ProtocolError> {
+        if data.len() < HEADER_SIZE {
+            return Err(ProtocolError::BufferTooShort {
+                need: HEADER_SIZE,
+                got: data.len(),
+            });
+        }
+
+        let mut header_slice: &[u8] = &data[..HEADER_SIZE];
+        let header = ChunkHeader::decode(&mut header_slice)?;
+
+        let nonce = crypto::nonce_from_sequence(header.sequence);
+        Chunk::decode_encrypted(data, key, &nonce)
+    }
+
     /// Total wire size of this chunk when encoded.
     pub fn wire_size(&self) -> usize {
         HEADER_SIZE + self.payload.len() + self.header.padding_length as usize + TAG_SIZE
     }
+}
+
+/// Maximum number of selective-ack ranges carried in a single `Ack`.
+///
+/// Bounds the decode cost and keeps an `Ack` well inside one control chunk
+/// (1 + 8 + 1 + 32 * 16 = 522 bytes). A receiver with more holes than this
+/// reports the lowest ones; the rest are covered by later acks or by replay.
+pub const MAX_SACK_RANGES: usize = 32;
+
+/// An inclusive range `[start, end]` of sequences received above the
+/// cumulative point of an `Ack`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SackRange {
+    pub start: u64,
+    pub end: u64,
 }
 
 /// Control message types sent within Control chunks.
@@ -230,6 +333,17 @@ pub enum ControlMessage {
     ScoreReport { node_id: String, score: f32 },
     SessionMigrate { new_token: Vec<u8> },
     Disconnect { reason: DisconnectReason },
+    /// Cumulative + selective acknowledgement (16.1.3).
+    ///
+    /// `next_expected`: every sequence strictly below it has been received
+    /// (TCP-style, so "nothing received yet" is simply `0`).
+    /// `ranges`: sequences received beyond the first hole, ascending, disjoint,
+    /// non-adjacent, each starting above `next_expected`.
+    ///
+    /// Acks are idempotent and monotonic in effect — applying a stale or
+    /// duplicated ack never un-acknowledges anything — so they are safe to
+    /// replay or reorder.
+    Ack { next_expected: u64, ranges: Vec<SackRange> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -279,6 +393,16 @@ impl ControlMessage {
                 buf.push(0x06);
                 buf.push(*reason as u8);
             }
+            Self::Ack { next_expected, ranges } => {
+                debug_assert!(ranges.len() <= MAX_SACK_RANGES);
+                buf.push(0x07);
+                buf.extend_from_slice(&next_expected.to_be_bytes());
+                buf.push(ranges.len() as u8);
+                for r in ranges {
+                    buf.extend_from_slice(&r.start.to_be_bytes());
+                    buf.extend_from_slice(&r.end.to_be_bytes());
+                }
+            }
         }
         buf
     }
@@ -319,12 +443,60 @@ impl ControlMessage {
                 };
                 Ok(Self::Disconnect { reason })
             }
+            0x07 => {
+                if data.len() < 10 {
+                    return Err(ProtocolError::BufferTooShort { need: 10, got: data.len() });
+                }
+                let next_expected = u64::from_be_bytes(data[1..9].try_into().unwrap());
+                let count = data[9] as usize;
+                if count > MAX_SACK_RANGES {
+                    return Err(ProtocolError::InvalidChunk(format!(
+                        "too many sack ranges: {count}"
+                    )));
+                }
+                let need = 10 + count * 16;
+                if data.len() < need {
+                    return Err(ProtocolError::BufferTooShort { need, got: data.len() });
+                }
+                let ranges: Vec<SackRange> = data[10..need]
+                    .chunks_exact(16)
+                    .map(|b| SackRange {
+                        start: u64::from_be_bytes(b[..8].try_into().unwrap()),
+                        end: u64::from_be_bytes(b[8..].try_into().unwrap()),
+                    })
+                    .collect();
+                validate_sack_ranges(next_expected, &ranges)?;
+                Ok(Self::Ack { next_expected, ranges })
+            }
             _ => Err(ProtocolError::InvalidChunk(format!(
                 "unknown control message type: 0x{:02x}",
                 data[0]
             ))),
         }
     }
+}
+
+/// Enforce the canonical form of an `Ack`'s ranges: each range well-formed,
+/// strictly above `next_expected` (a range touching it means the cumulative
+/// point should have advanced), and ascending with a gap between neighbours.
+///
+/// Rejecting non-canonical acks keeps the peer's input space small and makes
+/// processing cost linear in the (bounded) range count.
+fn validate_sack_ranges(next_expected: u64, ranges: &[SackRange]) -> Result<(), ProtocolError> {
+    let invalid = |why: &str| Err(ProtocolError::InvalidChunk(format!("invalid sack: {why}")));
+    // Next range must start strictly above `floor`. u128 so `end + 1` cannot
+    // overflow at the top of the sequence space.
+    let mut floor = next_expected as u128;
+    for r in ranges {
+        if r.start > r.end {
+            return invalid("range start > end");
+        }
+        if (r.start as u128) <= floor {
+            return invalid("range not ascending/disjoint above cumulative point");
+        }
+        floor = r.end as u128 + 1;
+    }
+    Ok(())
 }
 
 /// Proxy request types (sent as Data chunk payloads).
@@ -476,6 +648,35 @@ mod tests {
     }
 
     #[test]
+    fn test_sequenced_roundtrip_and_carries_sequence() {
+        let key = crypto::random_bytes::<32>();
+        let payload = b"sequenced payload".to_vec();
+
+        let chunk = Chunk::new_data(payload.clone());
+        let encoded = chunk.encode_sequenced(&key, 42).unwrap();
+        let decoded = Chunk::decode_sequenced(&encoded, &key).unwrap();
+
+        assert_eq!(decoded.payload, payload);
+        // The sequence assigned at encode time is recoverable from the wire.
+        assert_eq!(decoded.header.sequence, 42);
+    }
+
+    #[test]
+    fn test_sequence_is_authenticated() {
+        // The sequence lives in the header, which is AAD. Flipping a byte of it
+        // must fail decryption — otherwise an attacker could reorder or replay
+        // chunks by rewriting the sequence.
+        let key = crypto::random_bytes::<32>();
+        let mut encoded = Chunk::new_data(b"data".to_vec())
+            .encode_sequenced(&key, 7)
+            .unwrap();
+
+        // Byte index 2 is the first byte of the u64 sequence in the header.
+        encoded[9] ^= 0x01;
+        assert!(Chunk::decode_sequenced(&encoded, &key).is_err());
+    }
+
+    #[test]
     fn test_handshake_chunk() {
         let key = crypto::random_bytes::<32>();
         let nonce = crypto::random_bytes::<12>();
@@ -491,11 +692,100 @@ mod tests {
     }
 
     #[test]
+    fn test_chunk_types_roundtrip_through_a_byte() {
+        // Every type must survive the wire, and unknown ones must be rejected
+        // rather than silently treated as data.
+        for t in [
+            ChunkType::Handshake,
+            ChunkType::Data,
+            ChunkType::Control,
+            ChunkType::Padding,
+            ChunkType::Resume,
+        ] {
+            assert_eq!(ChunkType::from_byte(t as u8).unwrap(), t);
+        }
+        assert!(ChunkType::from_byte(0x06).is_err());
+    }
+
+    #[test]
+    fn test_resume_chunk_is_identifiable_from_the_header_alone() {
+        let key = crypto::random_bytes::<32>();
+        let nonce = crypto::random_bytes::<12>();
+        let encoded = Chunk::new_resume(b"resume payload".to_vec())
+            .encode_encrypted(&key, &nonce)
+            .unwrap();
+
+        // The header is plaintext, so the server can route the chunk before
+        // it knows which session's keys to use.
+        let header = ChunkHeader::decode(&mut &encoded[..HEADER_SIZE]).unwrap();
+        assert_eq!(header.chunk_type, ChunkType::Resume);
+
+        let decoded = Chunk::decode_encrypted(&encoded, &key, &nonce).unwrap();
+        assert_eq!(decoded.payload, b"resume payload");
+    }
+
+    #[test]
     fn test_control_message_roundtrip() {
         let msg = ControlMessage::Ping { timestamp: 1234567890 };
         let encoded = msg.encode();
         let decoded = ControlMessage::decode(&encoded).unwrap();
         assert_eq!(msg, decoded);
+    }
+
+    fn ack(next_expected: u64, ranges: &[(u64, u64)]) -> ControlMessage {
+        ControlMessage::Ack {
+            next_expected,
+            ranges: ranges.iter().map(|&(start, end)| SackRange { start, end }).collect(),
+        }
+    }
+
+    #[test]
+    fn test_ack_roundtrip() {
+        for msg in [
+            ack(0, &[]),
+            ack(5, &[(7, 9), (12, 12)]),
+            ack(0, &[(u64::MAX, u64::MAX)]),
+        ] {
+            let decoded = ControlMessage::decode(&msg.encode()).unwrap();
+            assert_eq!(msg, decoded);
+        }
+    }
+
+    #[test]
+    fn test_ack_max_ranges_roundtrip_fits_one_chunk() {
+        let ranges: Vec<(u64, u64)> =
+            (0..MAX_SACK_RANGES as u64).map(|i| (10 + i * 3, 11 + i * 3)).collect();
+        let msg = ack(0, &ranges);
+        let encoded = msg.encode();
+        assert_eq!(encoded.len(), 10 + MAX_SACK_RANGES * 16);
+        assert!(encoded.len() <= MAX_PAYLOAD_SIZE);
+        assert_eq!(ControlMessage::decode(&encoded).unwrap(), msg);
+    }
+
+    #[test]
+    fn test_ack_rejects_non_canonical_ranges() {
+        for bad in [
+            ack(5, &[(9, 7)]),           // start > end
+            ack(5, &[(5, 6)]),           // touches cumulative point
+            ack(5, &[(3, 4)]),           // below cumulative point
+            ack(0, &[(5, 8), (7, 10)]),  // overlapping
+            ack(0, &[(5, 8), (9, 10)]),  // adjacent (should be merged)
+            ack(0, &[(9, 10), (5, 6)]),  // descending
+            ack(0, &[(u64::MAX, u64::MAX), (1, 2)]),
+        ] {
+            assert!(ControlMessage::decode(&bad.encode()).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn test_ack_rejects_too_many_ranges_and_truncation() {
+        let mut encoded = ack(0, &[]).encode();
+        encoded[9] = (MAX_SACK_RANGES + 1) as u8;
+        assert!(ControlMessage::decode(&encoded).is_err());
+
+        let encoded = ack(0, &[(3, 4), (8, 9)]).encode();
+        assert!(ControlMessage::decode(&encoded[..encoded.len() - 1]).is_err());
+        assert!(ControlMessage::decode(&encoded[..9]).is_err());
     }
 
     #[test]

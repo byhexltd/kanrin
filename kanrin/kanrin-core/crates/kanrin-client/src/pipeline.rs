@@ -9,9 +9,10 @@ use kanrin_engine::detection::NetworkDetector;
 use kanrin_engine::prober::Prober;
 use kanrin_engine::scoreboard::{ScoreBoard, ScoreWeights};
 use kanrin_engine::switcher::Switcher;
+use kanrin_protocol::continuity::{ReceiveBuffer, Received, SendBuffer};
 use kanrin_protocol::handshake::{AuthStatus, ClientHandshake, ServerFinished, ServerHello};
 use kanrin_protocol::session::{Session, SessionId};
-use kanrin_protocol::wire::Chunk;
+use kanrin_protocol::wire::{Chunk, ChunkType, ControlMessage};
 use kanrin_routing::{RouteDecision, RoutingEngine};
 use kanrin_routing::iran::load_iran_preset;
 use kanrin_stealth::StealthPipeline;
@@ -23,9 +24,109 @@ use kanrin_tun::nat::NatTable;
 use kanrin_tun::packet::IpPacket;
 use kanrin_tun::routing::RoutingManager;
 
+use kanrin_protocol::crypto::SessionKeys;
+
 use crate::config::KanrinConfig;
 use crate::events::KanrinEvent;
+use crate::posture::{Posture, PostureController, Signal};
+use crate::switch::{self, LivenessMonitor, SwitchPolicy, SwitchReason, PROBE_INTERVAL};
 use crate::{ClientError, ClientState};
+
+/// Packets held between the TUN reader task and the encrypt/send loop.
+///
+/// Bounded on purpose: once the send buffer stops accepting work, this queue
+/// fills, the reader's `send().await` parks, and the pressure reaches the TUN
+/// device itself — which makes the guest TCP stacks slow down instead of us
+/// buffering the whole world.
+const TUN_QUEUE_DEPTH: usize = 256;
+
+/// Acknowledge the server after this many data chunks, or after this long,
+/// whichever comes first. Mirrors the server's policy: frequent enough that the
+/// peer's send buffer keeps draining, rare enough not to double the frame count.
+const ACK_EVERY_N_CHUNKS: usize = 32;
+const ACK_MAX_DELAY: Duration = Duration::from_millis(200);
+
+/// Move the session onto another transport without the tunnelled connections
+/// noticing (16.2.2).
+///
+/// Make-before-break (16.2.4): the replacement is connected, resumed and has
+/// carried the full replay *before* the active handle is replaced. If any of
+/// that fails, the old transport is still in place and still owns the session,
+/// so a failed switch costs nothing.
+///
+/// The old handle is not closed here. It is returned to the caller to be shut
+/// down once the new one has actually carried traffic.
+#[allow(clippy::too_many_arguments)]
+async fn attempt_switch(
+    reason: &SwitchReason,
+    connection: &mut Box<dyn Connection>,
+    active_transport: &mut String,
+    transport_registry: &TransportRegistry,
+    endpoint: &Endpoint,
+    session_id: SessionId,
+    keys: &SessionKeys,
+    send_buffer: &mut SendBuffer,
+    next_expected: u64,
+    policy: &mut SwitchPolicy,
+    monitor: &mut LivenessMonitor,
+    event_tx: &mpsc::UnboundedSender<KanrinEvent>,
+) -> Option<Box<dyn Connection>> {
+    if !policy.allows(reason) {
+        tracing::debug!(?reason, cooldown = ?policy.cooldown(), "switch suppressed by cooldown");
+        return None;
+    }
+
+    let mut standby = match switch::prepare_standby(
+        transport_registry,
+        endpoint,
+        active_transport,
+        session_id,
+        keys,
+        next_expected,
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "no standby transport could be prepared");
+            return None;
+        }
+    };
+
+    // The server told us what it already has; everything below that can go.
+    send_buffer.apply_ack(standby.server_next_expected, &[]);
+
+    let replayed = match switch::replay_onto(&mut standby.connection, send_buffer).await {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(error = %e, "replay onto standby failed — keeping current transport");
+            let _ = standby.connection.close().await;
+            return None;
+        }
+    };
+
+    // Atomic swap: from here on, everything goes out over the new transport.
+    let previous = std::mem::replace(connection, standby.connection);
+    let from = std::mem::replace(active_transport, standby.transport);
+
+    policy.record();
+    monitor.reset();
+
+    tracing::info!(from = %from, to = %active_transport, replayed, "transport switched");
+
+    // 16.2.6 — a switch is normal operation, so it is reported as such. An
+    // `Error` here would train users to distrust a feature that just saved
+    // their connection.
+    event_tx
+        .send(KanrinEvent::TransportSwitched {
+            from,
+            to: active_transport.clone(),
+            reason: reason.describe(),
+        })
+        .ok();
+
+    Some(previous)
+}
 
 /// Main pipeline — orchestrates the full VPN lifecycle:
 /// TUN Capture → Route → Encrypt → Shape → Transport → Network
@@ -148,11 +249,19 @@ pub async fn run_pipeline(
     // the session token. Using anything else (such as a stale value from the
     // config file) makes the server unable to match reply packets back to this
     // client, so every response would be silently dropped.
-    let assigned_ip = server_finished
-        .session_token
-        .as_deref()
-        .and_then(|token| <[u8; 4]>::try_from(token).ok())
-        .map(std::net::Ipv4Addr::from);
+    // Token layout: `tunnel_ip(4) || session_id(16)`. The id is the handle we
+    // present to reattach to this session after a transport switch.
+    let (assigned_ip, session_id) = match server_finished.session_token.as_deref() {
+        Some(token) if token.len() >= 20 => (
+            Some(std::net::Ipv4Addr::from(
+                <[u8; 4]>::try_from(&token[..4]).unwrap(),
+            )),
+            Some(SessionId::from_bytes(
+                <[u8; 16]>::try_from(&token[4..20]).unwrap(),
+            )),
+        ),
+        _ => (None, None),
+    };
 
     let tun_address: std::net::IpAddr = match assigned_ip {
         Some(ip) => {
@@ -168,8 +277,11 @@ pub async fn run_pipeline(
         }
     };
 
-    // Create session
-    let mut session = Session::new(SessionId::generate(), session_keys);
+    // Create session. Use the server's id so both sides agree on the handle
+    // a resumption request names.
+    let session_id = session_id.unwrap_or_else(SessionId::generate);
+    let resumption_keys = session_keys.clone();
+    let mut session = Session::new(session_id, session_keys);
 
     // === Phase 6: Setup TUN ===
     let tun_config = TunConfig {
@@ -246,17 +358,109 @@ pub async fn run_pipeline(
     // === Main Loop: TUN read → encrypt → send ===
     let mut stats_interval = tokio::time::interval(Duration::from_secs(5));
 
+    // Every data chunk is retained here until the server acknowledges it, so it
+    // can be replayed onto a new transport (16.1.5). The bound is what keeps a
+    // stalled or dead transport from growing this without limit.
+    let mut send_buffer = SendBuffer::with_default_capacity();
+
+    // The other direction: reorder and de-duplicate what the server sends, and
+    // acknowledge it so the server can release its own retained chunks. Without
+    // this an interrupted download could never be replayed.
+    let mut recv_buffer = ReceiveBuffer::with_default_capacity();
+    let mut unacked_chunks = 0usize;
+    let mut last_ack = tokio::time::Instant::now();
+
+    // Adaptive posture (16.4). Starts at the configured level and escalates
+    // on evidence; the floor keeps a user in a hostile network from being
+    // optimised back down during a quiet hour.
+    let mut posture = PostureController::new(Posture::Balanced);
+    let mut posture_tick = tokio::time::interval(Duration::from_secs(30));
+    posture_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    macro_rules! observe_signal {
+        ($signal:expr) => {{
+            let before = posture.current();
+            if let Some(after) = posture.observe($signal) {
+                tracing::info!(from = before.as_str(), to = after.as_str(), "posture changed");
+                event_tx
+                    .send(KanrinEvent::PostureChanged {
+                        from: before.as_str().to_string(),
+                        to: after.as_str().to_string(),
+                        reason: format!("{:?}", $signal),
+                    })
+                    .ok();
+            }
+        }};
+    }
+
+    // Transport switching state (16.2).
+    let mut active_transport = transport_name.to_string();
+    let mut policy = SwitchPolicy::new();
+    let mut monitor = LivenessMonitor::new();
+    let mut liveness_tick = tokio::time::interval(PROBE_INTERVAL);
+    liveness_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    // The transport we just switched away from, kept open until the new one
+    // has actually delivered something (16.2.4). Closing it any earlier would
+    // make a failed switch unrecoverable.
+    let mut draining: Option<Box<dyn Connection>> = None;
+
+    // Consecutive failed switch attempts; the tunnel is only abandoned once
+    // nothing at all can be established.
+    let mut failed_switches = 0u32;
+    const MAX_FAILED_SWITCHES: u32 = 5;
+
+    macro_rules! switch_or_give_up {
+        ($reason:expr) => {{
+            let reason = $reason;
+            let next_expected = recv_buffer.next_expected();
+            let previous = attempt_switch(
+                &reason,
+                &mut connection,
+                &mut active_transport,
+                &transport_registry,
+                &endpoint,
+                session_id,
+                &resumption_keys,
+                &mut send_buffer,
+                next_expected,
+                &mut policy,
+                &mut monitor,
+                &event_tx,
+            )
+            .await;
+
+            match previous {
+                Some(old) => {
+                    failed_switches = 0;
+                    if let Some(mut stale) = draining.replace(old) {
+                        let _ = stale.close().await;
+                    }
+                }
+                None => {
+                    failed_switches += 1;
+                    if failed_switches >= MAX_FAILED_SWITCHES {
+                        tracing::error!(attempts = failed_switches, "no transport could carry the session");
+                        break;
+                    }
+                }
+            }
+        }};
+    }
+
     // TUN reads happen in a dedicated task. Awaiting them directly in the
     // `select!` below would abandon an in-flight blocking read whenever another
     // branch wins, silently dropping that packet. Channel receives are
     // cancel-safe, so the loop can poll them freely.
-    let (tun_tx, mut tun_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (tun_tx, mut tun_rx) = mpsc::channel::<Vec<u8>>(TUN_QUEUE_DEPTH);
     let reader_tun = tun_device.clone();
     let tun_reader = tokio::spawn(async move {
         loop {
             match reader_tun.read_packet().await {
                 Ok(raw) => {
-                    if tun_tx.send(raw).is_err() {
+                    // Awaiting here is the back-pressure: while the queue is
+                    // full this task stops reading the device.
+                    if tun_tx.send(raw).await.is_err() {
                         break;
                     }
                 }
@@ -270,8 +474,12 @@ pub async fn run_pipeline(
 
     loop {
         tokio::select! {
-            // Read from TUN (outgoing traffic)
-            packet = tun_rx.recv() => {
+            // Read from TUN (outgoing traffic).
+            //
+            // Disabled while the send buffer is at its bound: unacknowledged
+            // data must not be discarded (it may still need replaying), so the
+            // only correct response to a full buffer is to stop producing.
+            packet = tun_rx.recv(), if !send_buffer.is_full() => {
                 let Some(raw) = packet else {
                     tracing::warn!("TUN reader stopped");
                     break;
@@ -288,11 +496,24 @@ pub async fn run_pipeline(
 
                     // Encrypt and send through tunnel
                     let chunk = Chunk::new_data(raw);
+                    let sequence = session.send_nonce_value();
                     match session.encrypt_outgoing(&chunk, true) {
                         Ok(encrypted) => {
-                            if let Err(e) = connection.send(&encrypted).await {
-                                tracing::warn!(error = %e, "send failed");
-                                break;
+                            let sent = connection.send(&encrypted).await;
+
+                            // Retain regardless of the outcome: a chunk the
+                            // transport failed on is exactly the one a replay
+                            // has to resend.
+                            if let Err(e) = send_buffer.push(sequence, encrypted) {
+                                tracing::warn!(error = %e, "send buffer rejected chunk");
+                            }
+
+                            if let Err(e) = sent {
+                                // Not fatal any more: the chunk is retained, so
+                                // a switch replays it and the inner stream
+                                // never learns the transport changed.
+                                tracing::warn!(error = %e, "send failed — switching transport");
+                                switch_or_give_up!(SwitchReason::TransportError(e.to_string()));
                             }
                         }
                         Err(e) => {
@@ -307,21 +528,104 @@ pub async fn run_pipeline(
             data = connection.recv() => {
                 match data {
                     Ok(encrypted) => {
+                        // Any inbound frame proves the transport is alive, and
+                        // proves the switch that produced it worked — so the
+                        // one it replaced can finally be shut down (16.2.4).
+                        monitor.record_inbound();
+                        if let Some(mut old) = draining.take() {
+                            let _ = old.close().await;
+                        }
+
                         match session.decrypt_incoming(&encrypted, true) {
-                            Ok(chunk) => {
-                                // Write decrypted packet back to TUN
-                                let _ = tun_device.write_packet(&chunk.payload).await;
-                            }
+                            Ok(chunk) => match chunk.header.chunk_type {
+                                // An ack is what releases the send buffer, and
+                                // so what lifts back-pressure off the TUN reader.
+                                ChunkType::Control => {
+                                    match ControlMessage::decode(&chunk.payload) {
+                                        Ok(ControlMessage::Ack { next_expected, ranges }) => {
+                                            send_buffer.apply_ack(next_expected, &ranges);
+                                        }
+                                        Ok(other) => tracing::debug!(?other, "control message"),
+                                        Err(e) => tracing::warn!(error = %e, "bad control message"),
+                                    }
+                                }
+                                ChunkType::Data => {
+                                    let sequence = chunk.header.sequence;
+                                    match recv_buffer.accept(sequence, chunk.payload) {
+                                        Ok(Received::Duplicate) => {}
+                                        Ok(_) => {
+                                            for packet in recv_buffer.drain_ready() {
+                                                let _ = tun_device.write_packet(&packet).await;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(error = %e, "receive buffer full");
+                                            continue;
+                                        }
+                                    }
+
+                                    unacked_chunks += 1;
+                                    let due = unacked_chunks >= ACK_EVERY_N_CHUNKS
+                                        || last_ack.elapsed() >= ACK_MAX_DELAY;
+                                    if due {
+                                        unacked_chunks = 0;
+                                        last_ack = tokio::time::Instant::now();
+                                        let ack = Chunk::new_control(recv_buffer.build_ack().encode());
+                                        match session.encrypt_outgoing(&ack, true) {
+                                            // Acks are not retained: a lost one
+                                            // is superseded by the next.
+                                            Ok(bytes) => {
+                                                if let Err(e) = connection.send(&bytes).await {
+                                                    tracing::warn!(error = %e, "ack send failed");
+                                                    switch_or_give_up!(
+                                                        SwitchReason::TransportError(e.to_string())
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => tracing::warn!(error = %e, "ack encrypt failed"),
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            },
                             Err(e) => {
                                 tracing::warn!(error = %e, "decrypt failed");
                             }
                         }
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, "recv failed — connection lost");
-                        break;
+                        tracing::warn!(error = %e, "recv failed — switching transport");
+                        observe_signal!(Signal::SuspiciousReset);
+                        switch_or_give_up!(SwitchReason::TransportError(e.to_string()));
                     }
                 }
+            }
+
+            // Liveness (16.2.3). A transport can fail without erroring — the
+            // socket stays open and nothing ever arrives — which is exactly
+            // what blocking looks like. Silence is therefore treated as death.
+            _ = liveness_tick.tick() => {
+                if monitor.is_dead() {
+                    tracing::warn!(silent_for = ?monitor.silent_for(), "link went silent");
+                    // A healthy path going abruptly silent is the signature of
+                    // interference, not of congestion (16.4.5).
+                    observe_signal!(Signal::SuddenPathLoss);
+                    switch_or_give_up!(SwitchReason::LinkSilent);
+                } else if monitor.should_probe() {
+                    let ping = ControlMessage::Ping {
+                        timestamp: kanrin_protocol::handshake::current_timestamp(),
+                    };
+                    if let Ok(bytes) = session.encrypt_outgoing(&Chunk::new_control(ping.encode()), true) {
+                        let _ = connection.send(&bytes).await;
+                    }
+                }
+            }
+
+            // A period with no adverse signal is itself evidence (16.4.4).
+            // Relaxation needs a run of these plus time at the posture, so a
+            // single quiet moment inside an active block cannot trigger it.
+            _ = posture_tick.tick() => {
+                observe_signal!(Signal::CleanPeriod);
             }
 
             // Periodic stats

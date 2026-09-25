@@ -8,6 +8,7 @@ description = "Kanrin wire protocol, cryptography, handshake, and session manage
 chacha20poly1305 = { workspace = true }
 x25519-dalek = { workspace = true }
 hkdf = { workspace = true }
+hmac = { workspace = true }
 sha2 = { workspace = true }
 rand = { workspace = true }
 zeroize = { workspace = true }

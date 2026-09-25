@@ -23,6 +23,12 @@ pub enum ProtocolError {
     #[error("nonce exhausted — must rotate keys")]
     NonceExhausted,
 
+    #[error("send buffer full: {buffered} of {max} bytes held unacknowledged")]
+    SendBufferFull { buffered: usize, max: usize },
+
+    #[error("receive buffer full: {buffered} of {max} bytes held out of order")]
+    ReceiveBufferFull { buffered: usize, max: usize },
+
     #[error("buffer too short: need {need} bytes, got {got}")]
     BufferTooShort { need: usize, got: usize },
 

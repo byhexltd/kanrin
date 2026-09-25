@@ -1,11 +1,13 @@
 mod config;
 mod forwarder;
 mod listener;
+mod registry;
 mod session;
 
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
 
@@ -14,7 +16,8 @@ use kanrin_tun::device::{TunConfig, TunDevice};
 use config::ServerConfig;
 use forwarder::PacketForwarder;
 use listener::KanrinListener;
-use session::{ClientSession, IpAllocator};
+use registry::SessionRegistry;
+use session::{ClientSession, ConnectionOutcome, IpAllocator};
 
 #[derive(Parser)]
 #[command(name = "kanrin-server")]
@@ -95,6 +98,32 @@ async fn main() -> anyhow::Result<()> {
     // Bind listener
     let listener = KanrinListener::bind(config.clone()).await?;
 
+    // Sessions outlive the connections carrying them, so a client switching
+    // transports keeps its tunnel address and continuity state (Phase 16.2).
+    let registry = Arc::new(SessionRegistry::new());
+
+    // Addresses therefore belong to registry entries, not to connections:
+    // only expiry returns one to the pool.
+    {
+        let registry = registry.clone();
+        let ip_allocator = ip_allocator.clone();
+        let forwarder = forwarder.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(10));
+            loop {
+                ticker.tick().await;
+                for ip in registry.reap_expired() {
+                    // Unregister before releasing: otherwise the forwarder
+                    // would still hold a queue for an address about to be
+                    // handed to a different client.
+                    forwarder.unregister_client(ip);
+                    ip_allocator.release(ip);
+                    tracing::info!(tunnel_ip = %ip, "session expired, address reclaimed");
+                }
+            }
+        });
+    }
+
     // Accept loop
     let active_clients = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
@@ -120,14 +149,21 @@ async fn main() -> anyhow::Result<()> {
         let forwarder = forwarder.clone();
         let active_clients = active_clients.clone();
         let ip_allocator = ip_allocator.clone();
+        let registry = registry.clone();
         active_clients.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         tokio::spawn(async move {
             let session = ClientSession::new(tls_stream, peer_addr, config, assigned_ip);
-            if let Err(e) = session.run(forwarder).await {
-                tracing::error!(peer = %peer_addr, error = %e, "session error");
+            match session.run(forwarder, registry).await {
+                // A resuming connection never touched the address we reserved
+                // for it, so it goes straight back.
+                Ok(ConnectionOutcome::AddressUnused) => ip_allocator.release(assigned_ip),
+                Ok(ConnectionOutcome::AddressTaken) => {}
+                Err(e) => {
+                    tracing::error!(peer = %peer_addr, error = %e, "session error");
+                    ip_allocator.release(assigned_ip);
+                }
             }
-            ip_allocator.release(assigned_ip);
             active_clients.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         });
     }
@@ -171,7 +207,6 @@ dns:
 
 fn cmd_gen_cert() -> anyhow::Result<()> {
     use rcgen::{CertificateParams, KeyPair};
-    use std::time::Duration;
 
     println!("[*] Generating self-signed TLS certificate...");
 

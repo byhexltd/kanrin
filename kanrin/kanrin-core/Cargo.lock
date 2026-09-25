@@ -1373,6 +1373,7 @@ dependencies = [
  "bytes",
  "chacha20poly1305",
  "hkdf",
+ "hmac",
  "rand 0.8.7",
  "serde",
  "sha2",

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use crate::crypto::{self, NonceCounter, SessionKeys, NONCE_SIZE};
+use crate::crypto::{self, SessionKeys, MAX_NONCE};
 use crate::error::ProtocolError;
 use crate::wire::Chunk;
 
@@ -38,8 +38,12 @@ pub struct Session {
     pub id: SessionId,
     pub state: SessionState,
     keys: SessionKeys,
-    send_nonce: NonceCounter,
-    recv_nonce: NonceCounter,
+    /// Next sequence number to assign to an outgoing chunk. Monotonic; seeds the
+    /// AEAD nonce and is carried on the wire so the peer decrypts order-independently.
+    send_seq: u64,
+    /// Count of chunks received (diagnostics). Ordering and duplicate handling are
+    /// the job of the continuity layer (16.1.4), not of this counter.
+    recv_count: u64,
     created_at: Instant,
     last_activity: Instant,
     pub bytes_sent: u64,
@@ -55,8 +59,8 @@ impl Session {
             id,
             state: SessionState::Active,
             keys,
-            send_nonce: NonceCounter::new(),
-            recv_nonce: NonceCounter::new(),
+            send_seq: 0,
+            recv_count: 0,
             created_at: now,
             last_activity: now,
             bytes_sent: 0,
@@ -74,8 +78,12 @@ impl Session {
             &self.keys.server_write_key
         };
 
-        let nonce = self.send_nonce.next()?;
-        let encoded = chunk.encode_encrypted(key, &nonce)?;
+        let seq = self.send_seq;
+        if seq >= MAX_NONCE {
+            return Err(ProtocolError::NonceExhausted);
+        }
+        let encoded = chunk.encode_sequenced(key, seq)?;
+        self.send_seq += 1;
 
         self.bytes_sent += encoded.len() as u64;
         self.last_activity = Instant::now();
@@ -92,8 +100,11 @@ impl Session {
             &self.keys.client_write_key
         };
 
-        let nonce = self.recv_nonce.next()?;
-        let chunk = Chunk::decode_encrypted(data, key, &nonce)?;
+        // The nonce is derived from the sequence carried in the (authenticated)
+        // header, not from a positional counter, so chunks that arrive reordered,
+        // replayed onto a new transport, or striped across paths still decrypt.
+        let chunk = Chunk::decode_sequenced(data, key)?;
+        self.recv_count += 1;
 
         self.bytes_received += data.len() as u64;
         self.last_activity = Instant::now();
@@ -147,14 +158,14 @@ impl Session {
         self.state = SessionState::Closed;
     }
 
-    /// Get current send nonce value (for diagnostics).
+    /// Next outgoing sequence number (also the count of chunks sent so far).
     pub fn send_nonce_value(&self) -> u64 {
-        self.send_nonce.current()
+        self.send_seq
     }
 
-    /// Get current recv nonce value (for diagnostics).
+    /// Count of chunks received so far (for diagnostics).
     pub fn recv_nonce_value(&self) -> u64 {
-        self.recv_nonce.current()
+        self.recv_count
     }
 }
 
@@ -296,6 +307,53 @@ mod tests {
         manager.create_session(test_keys()).unwrap();
         let result = manager.create_session(test_keys());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_out_of_order_decrypt() {
+        // The core guarantee of 16.1.1: because the nonce is derived from the
+        // sequence carried in each chunk (not a positional counter), the receiver
+        // can decrypt chunks in any order. This is what makes reorder buffers,
+        // replay onto a new transport, and multipath possible without reworking
+        // the crypto layer. Under the old positional-counter scheme this failed.
+        let keys = test_keys();
+        let mut client = Session::new(SessionId::generate(), keys.clone());
+        let mut server = Session::new(SessionId::generate(), keys);
+
+        let c0 = client.encrypt_outgoing(&Chunk::new_data(b"zero".to_vec()), true).unwrap();
+        let c1 = client.encrypt_outgoing(&Chunk::new_data(b"one".to_vec()), true).unwrap();
+        let c2 = client.encrypt_outgoing(&Chunk::new_data(b"two".to_vec()), true).unwrap();
+
+        // Deliver reordered: 2, 0, 1.
+        let d2 = server.decrypt_incoming(&c2, false).unwrap();
+        let d0 = server.decrypt_incoming(&c0, false).unwrap();
+        let d1 = server.decrypt_incoming(&c1, false).unwrap();
+
+        assert_eq!(d2.payload, b"two");
+        assert_eq!(d0.payload, b"zero");
+        assert_eq!(d1.payload, b"one");
+
+        // Sequence is carried on the wire and recoverable regardless of arrival order.
+        assert_eq!(d0.header.sequence, 0);
+        assert_eq!(d1.header.sequence, 1);
+        assert_eq!(d2.header.sequence, 2);
+    }
+
+    #[test]
+    fn test_duplicate_chunk_decrypts_identically() {
+        // A replayed chunk (same bytes) decrypts to the same payload because the
+        // nonce travels with it. Deciding to *drop* the duplicate is the
+        // continuity layer's job (16.1.4); the crypto layer must not desync.
+        let keys = test_keys();
+        let mut client = Session::new(SessionId::generate(), keys.clone());
+        let mut server = Session::new(SessionId::generate(), keys);
+
+        let c0 = client.encrypt_outgoing(&Chunk::new_data(b"payload".to_vec()), true).unwrap();
+        let first = server.decrypt_incoming(&c0, false).unwrap();
+        let again = server.decrypt_incoming(&c0, false).unwrap();
+        assert_eq!(first.payload, b"payload");
+        assert_eq!(again.payload, b"payload");
+        assert_eq!(first.header.sequence, again.header.sequence);
     }
 
     #[test]

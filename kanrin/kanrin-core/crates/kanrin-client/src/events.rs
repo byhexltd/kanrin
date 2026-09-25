@@ -26,6 +26,17 @@ pub enum KanrinEvent {
         reason: String,
     },
 
+    /// Adaptive posture changed (16.4.6).
+    ///
+    /// Reported as a normal state change, not a warning: escalating is the
+    /// client working as intended, and labelling it as a problem would push
+    /// users to disable the thing protecting them.
+    PostureChanged {
+        from: String,
+        to: String,
+        reason: String,
+    },
+
     /// Censorship detection result.
     CensorshipDetected {
         state: String,
