@@ -15,8 +15,12 @@ use kanrin_protocol::resume::{ResumeRequest, ResumeResponse, ResumeStatus};
 use kanrin_protocol::session::SessionId;
 use kanrin_protocol::wire::{Chunk, ChunkHeader, ChunkType, ControlMessage, HEADER_SIZE};
 
+use kanrin_protocol::handshake::current_timestamp;
+
 use crate::config::ServerConfig;
 use crate::forwarder::PacketForwarder;
+use crate::frontdoor::{Admission, Admitter, ResponseTimer};
+use crate::http::{ParseError, RequestHead};
 use crate::registry::{SessionEntry, SessionRegistry};
 
 /// Acknowledge after this many data chunks. The client cannot release its send
@@ -31,6 +35,9 @@ const ACK_EVERY_N_CHUNKS: usize = 32;
 /// `read_exact`, which is not cancel-safe, so racing it against an interval in
 /// a `select!` would abandon partially-read frames.
 const ACK_MAX_DELAY: Duration = Duration::from_millis(200);
+
+/// Cap on a front-door request body, matching what a static origin accepts.
+const MAX_REQUEST_BODY: usize = 1024 * 1024;
 
 /// What became of the tunnel address the acceptor reserved for a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,7 +132,50 @@ impl ClientSession {
         }
     }
 
-    /// Serve one connection.
+    /// Serve one connection — the single code path of Phase 17.1.
+    ///
+    /// Every connection, without exception, is first served as HTTP by the
+    /// same code in the same order with the same timing. Only *after* that
+    /// response has been written is the request examined for a tunnel
+    /// authenticator, and only then may the connection be upgraded.
+    ///
+    /// The ordering is the substance of the defence. Reality (**T3**) fell
+    /// because authentication chose which stack answered, so the branches
+    /// could be told apart without any key. Here authentication chooses
+    /// nothing about the answer; it is a property discovered about a request
+    /// that was going to be served identically either way.
+    pub async fn run(
+        mut self,
+        forwarder: Arc<PacketForwarder>,
+        registry: Arc<SessionRegistry>,
+        admitter: Arc<Admitter>,
+    ) -> anyhow::Result<ConnectionOutcome> {
+        // 17.1.7 — started before any work, awaited just before the response,
+        // so the floor absorbs the work instead of being added to it.
+        let timer = ResponseTimer::start();
+
+        let head = self.read_request_head().await?;
+        let body = self.read_body(&head).await?;
+
+        // 17.1.3/17.1.4/17.1.5 — one content path for everyone.
+        let response = self.config.origin().respond(&head, &body).await;
+
+        // 17.1.6 — decided here, but it changes nothing about `response`.
+        let admission = admitter.admit(&head, current_timestamp());
+
+        timer.wait().await;
+        self.send_raw(&response).await?;
+
+        if admission == Admission::Web {
+            // An ordinary visitor. Keep serving requests for as long as they
+            // want to make them, exactly as the origin would.
+            return self.serve_web(admitter).await;
+        }
+
+        self.run_tunnel(forwarder, registry).await
+    }
+
+    /// The tunnel, entered only from an authenticated request.
     ///
     /// The first chunk decides which of two things this is. Its type is
     /// readable from the plaintext header, so the choice needs no key and no
@@ -136,7 +186,7 @@ impl ClientSession {
     /// - `Resume` — a transport switch. The client proves it owns a live
     ///   session and reattaches to it, keeping its address, sequence counters
     ///   and both continuity buffers.
-    pub async fn run(
+    async fn run_tunnel(
         mut self,
         forwarder: Arc<PacketForwarder>,
         registry: Arc<SessionRegistry>,
@@ -517,6 +567,92 @@ impl ClientSession {
             bytes_tx = s.bytes_sent,
             "connection ended"
         );
+    }
+
+    /// Read one HTTP request head, and nothing past it.
+    ///
+    /// Reads byte by byte to the blank line rather than filling a buffer:
+    /// anything read beyond the head would belong to the body or to the first
+    /// tunnel frame, and the two paths must not differ in how much they
+    /// consume.
+    async fn read_request_head(&mut self) -> anyhow::Result<RequestHead> {
+        let mut buf = Vec::with_capacity(1024);
+        let mut byte = [0u8; 1];
+
+        loop {
+            self.stream.read_exact(&mut byte).await?;
+            buf.push(byte[0]);
+
+            match RequestHead::parse(&buf) {
+                Ok(head) => return Ok(head),
+                Err(ParseError::Incomplete) => continue,
+                // Malformed and oversized both end the connection, as any
+                // server does — and identically to each other, so neither
+                // reveals which rule was hit.
+                Err(_) => anyhow::bail!("bad request"),
+            }
+        }
+    }
+
+    async fn read_body(&mut self, head: &RequestHead) -> anyhow::Result<Vec<u8>> {
+        let length = head.content_length().unwrap_or(0);
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+        if length > MAX_REQUEST_BODY {
+            anyhow::bail!("bad request");
+        }
+        let mut body = vec![0u8; length];
+        self.stream.read_exact(&mut body).await?;
+        Ok(body)
+    }
+
+    async fn send_raw(&mut self, data: &[u8]) -> anyhow::Result<()> {
+        self.stream.write_all(data).await?;
+        self.stream.flush().await?;
+        Ok(())
+    }
+
+    /// Keep-alive loop for an ordinary visitor (17.1.4).
+    ///
+    /// A front door that closed after one response, while the origin it
+    /// claims to be keeps connections alive, would be distinguishable without
+    /// reading a byte of content. So this is a real keep-alive loop, and a
+    /// later request on the same connection can still carry an authenticator
+    /// — a browser that gets a page and then upgrades is ordinary behaviour.
+    async fn serve_web(
+        mut self,
+        admitter: Arc<Admitter>,
+    ) -> anyhow::Result<ConnectionOutcome> {
+        loop {
+            let timer = ResponseTimer::start();
+
+            let head = match self.read_request_head().await {
+                Ok(h) => h,
+                // The visitor went away. Normal, and not worth a log line at
+                // any level an operator would notice.
+                Err(_) => return Ok(ConnectionOutcome::AddressUnused),
+            };
+            let keep_alive = head.wants_keep_alive();
+            let body = self.read_body(&head).await.unwrap_or_default();
+
+            let response = self.config.origin().respond(&head, &body).await;
+            let admission = admitter.admit(&head, current_timestamp());
+
+            timer.wait().await;
+            self.send_raw(&response).await?;
+
+            if admission == Admission::Tunnel {
+                break;
+            }
+            if !keep_alive {
+                return Ok(ConnectionOutcome::AddressUnused);
+            }
+        }
+
+        // Reached only via an authenticator, so this is unreachable for
+        // anyone probing the port.
+        anyhow::bail!("tunnel upgrade on a keep-alive connection is not yet wired")
     }
 
     /// Read a length-prefixed frame from the TLS stream.

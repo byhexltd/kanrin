@@ -1,6 +1,9 @@
 mod config;
 mod forwarder;
+mod frontdoor;
+mod http;
 mod listener;
+mod origin;
 mod registry;
 mod session;
 
@@ -16,6 +19,7 @@ use kanrin_tun::device::{TunConfig, TunDevice};
 use config::ServerConfig;
 use forwarder::PacketForwarder;
 use listener::KanrinListener;
+use frontdoor::Admitter;
 use registry::SessionRegistry;
 use session::{ClientSession, ConnectionOutcome, IpAllocator};
 
@@ -102,6 +106,9 @@ async fn main() -> anyhow::Result<()> {
     // transports keeps its tunnel address and continuity state (Phase 16.2).
     let registry = Arc::new(SessionRegistry::new());
 
+    // Validates tunnel authenticators carried on ordinary requests (17.1.6).
+    let admitter = Arc::new(Admitter::new(&config.password));
+
     // Addresses therefore belong to registry entries, not to connections:
     // only expiry returns one to the pool.
     {
@@ -150,11 +157,12 @@ async fn main() -> anyhow::Result<()> {
         let active_clients = active_clients.clone();
         let ip_allocator = ip_allocator.clone();
         let registry = registry.clone();
+        let admitter = admitter.clone();
         active_clients.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         tokio::spawn(async move {
             let session = ClientSession::new(tls_stream, peer_addr, config, assigned_ip);
-            match session.run(forwarder, registry).await {
+            match session.run(forwarder, registry, admitter).await {
                 // A resuming connection never touched the address we reserved
                 // for it, so it goes straight back.
                 Ok(ConnectionOutcome::AddressUnused) => ip_allocator.release(assigned_ip),

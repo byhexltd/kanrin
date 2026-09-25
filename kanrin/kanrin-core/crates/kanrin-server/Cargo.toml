@@ -23,6 +23,7 @@ serde = { workspace = true }
 serde_yaml = { workspace = true }
 clap = { workspace = true }
 parking_lot = { workspace = true }
+rand = { workspace = true }
 dashmap = { workspace = true }
 bytes = { workspace = true }
 rcgen = { workspace = true }

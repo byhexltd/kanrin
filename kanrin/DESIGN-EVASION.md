@@ -210,6 +210,40 @@ Summary of the five groups, each expanded in `TASKS-4.md`:
 
 ---
 
+## 3a. Divergence Audit (task 17.1.1)
+
+**T3** says Reality was broken not by a cryptographic weakness but by a
+*behavioral* one: the authenticated branch and the forwarded branch were
+served by different code, and a prober could tell them apart. So the audit
+below asks one question of every point in the server: *can an unauthenticated
+observer obtain a different answer than an authenticated one?*
+
+Baseline as of the Phase 16 code. `D-n` tags are referenced by the tasks that
+close them.
+
+| Tag | Divergence | Where | Observable as | Closed by |
+|-----|-----------|-------|---------------|-----------|
+| **D1** | A connection that completes TLS but sends no valid `ClientHello` chunk is dropped with no response at all. A real web server answers *something*. | `session.rs::run`, the `anyhow::bail!` on an unexpected first chunk | Silence on a port that presents a valid certificate — the classic "this is a proxy" tell | 17.1.4, 17.5.2 |
+| **D2** | There is no non-tunnel content whatsoever. The only thing the port can do is speak Kanrin. | whole server | A prober issuing `GET /` gets a TLS session that then hangs | 17.1.3, 17.1.4 |
+| **D3** | Authentication failure closes the connection after a `ServerFinished`; success continues into data mode. Two distinct post-handshake behaviors. | `session.rs::accept_new` early return on `auth_status != Ok` | Connection-lifetime difference measurable without any decryption | 17.1.6 |
+| **D4** | Failure paths return immediately; the success path does a TUN registration and a registry insert first. | `accept_new` | Timing difference correlated with the auth outcome | 17.1.7 |
+| **D5** | `Resume` for an unknown or unverifiable session drops the connection silently, with a different byte count from a rejected `Handshake`. | `session.rs::accept_resume` | A second silent-drop class, distinguishable by bytes-before-close | 17.1.6, 17.1.7 |
+| **D6** | ALPN advertises `h2` and `http/1.1`, and the server then speaks neither. | `listener.rs::bind` | Negotiating `h2` and receiving a non-HTTP/2 stream is an immediate mismatch | 17.1.2, 17.1.4 |
+| **D7** | TLS parameters are rustls defaults, not those of the origin the deployment claims to be. | `listener.rs::bind` | Fingerprint mismatch against the claimed origin (**T4**) | 17.1.2 |
+| **D8** | Errors are logged per-class (`tls handshake failed`, `decrypt failed`, `resume rejected`), so operators can distinguish cases the wire is supposed to make identical. | throughout | Not remotely observable, but it is how an invariance regression escapes notice | 17.1.9-17.1.12 |
+
+**The shape of the fix.** D1, D2 and D6 are one problem: the port does not
+actually host a web server. D3, D4 and D5 are one problem: authentication is a
+*branch taken before the response*, when it must instead be something
+*discovered inside a session that was going to be served anyway*. That is the
+whole of 17.1.6, and it is the difference between Kanrin and Reality.
+
+**Non-goal.** Making the two cases indistinguishable to someone holding the
+server's private key is neither possible nor necessary. The threat model is an
+on-path prober without keys (**T3**, **T8**).
+
+---
+
 ## 4. Placement in `ROADMAP.md`
 
 Phase 17 does not displace the existing order. It refines it:

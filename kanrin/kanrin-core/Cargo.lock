@@ -1410,6 +1410,7 @@ dependencies = [
  "kanrin-protocol",
  "kanrin-tun",
  "parking_lot",
+ "rand 0.8.7",
  "rcgen",
  "rustls",
  "rustls-pemfile",
